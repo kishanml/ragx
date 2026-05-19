@@ -4,6 +4,7 @@ import hashlib
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 
+
 nltk.download('stopwords')
 nltk.download('punkt')
 
@@ -23,6 +24,44 @@ def preprocess_text(text : str):
     filtered_tokens = [word for word in tokens if word not in stop_words]
 
     return " ".join(filtered_tokens)
+
+
+def create_summary_chunks(chunks, fixed_keys):
+    new_chunks = []
+    for chunk in chunks:
+        new_chunk = {}
+        for k, v in chunk.items():
+            if k in fixed_keys:
+                new_chunk[k] = v
+            elif k == "summary":
+                new_chunk["embedding_text"] = v
+        new_chunks.append(new_chunk)
+    return new_chunks
+
+
+def create_questions_chunks(chunks, fixed_keys):
+    new_chunks = []
+    for chunk in chunks:
+        new_chunk = {}
+        for k, v in chunk.items():
+            if k in fixed_keys:
+                new_chunk[k] = v
+            elif k == "questions":
+                new_chunk["embedding_text"] = "\n".join(v)
+        new_chunks.append(new_chunk)
+    return new_chunks
+
+
+def get_file_hash(file_path):
+    print('Generating file hash')
+
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        hasher.update(f.read())
+    file_hash = hasher.hexdigest()
+    print(f'File hash: {file_hash}')
+
+    return file_hash
 
 class Timer:
     
