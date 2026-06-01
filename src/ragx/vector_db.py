@@ -1,42 +1,45 @@
-import sqlite3
+import os
 import faiss
 import numpy as np
-from pathlib import Path
 from sentence_transformers import SentenceTransformer
+from pathlib import Path
+import uuid
+from copy import deepcopy
+from sqlite_crud import SQLiteCRUD
 
 
 class VectorDB:
 
     def __init__(self,
-                 index_path: str,
-                 db_path: str,
+                 path: str,
+                 table_name: str = "chunks",
                  model_name: str = "all-MiniLM-L6-v2",
                  ):
 
         # Initializing Model
         self.model = SentenceTransformer(model_name)
 
+        # create path if not exists
+        os.makedirs(path, exist_ok=True)
+
         # Initializing Index Path
-        self.index_path: str = index_path
+        self.index_path: str = os.path.join(path, "index.faiss")
 
         # Initializing SQLite database
-        self.db_path = db_path
-        conn = sqlite3.connect(db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS chunks (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_hash TEXT,
-                title   TEXT,
-                source    TEXT,
-                cleaned_text      TEXT,
-                embedding_text   TEXT
-            )
-        """)
-        conn.commit()
-        conn.close()
+        self.db_path = os.path.join(path, "db.sqlite")
+        self.table_name = table_name
+        if not Path(self.db_path).exists():
+            sqlite_obj = SQLiteCRUD(self.db_path)
+            sqlite_obj.create_table(self.table_name, {
+                "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+                "text": "TEXT",
+                "chunk_id": "INTEGER",
+                "file_hash": "TEXT"
+            })
+            sqlite_obj.close()
 
     def _load_faiss(self):
-        print('Loading FAISS index')
+        # print('Loading FAISS index')
         if self.index_path is not None and Path(self.index_path).exists():
             index = faiss.read_index(self.index_path)
         else:
@@ -49,48 +52,39 @@ class VectorDB:
         print(f'FAISS saved: {self.index_path}')
 
     def _append_chunks_to_db(self, file_hash, chunks):
-        conn = sqlite3.connect(self.db_path)
-        conn.executemany(
-            "INSERT INTO chunks (file_hash, title, source, cleaned_text, embedding_text) VALUES (?,?,?,?,?)",
-            [(file_hash, chunk['title'], chunk['source'], chunk['cleaned_text'], chunk['embedding_text']) for chunk in
-             chunks]
-        )
-        conn.commit()
-        conn.close()
-
-    def _check_if_file_processed(self, file_hash):
-        conn = sqlite3.connect(self.db_path)
-        (count,) = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_hash=?", (file_hash,)).fetchone()
-        conn.close()
-        print(f'Existing records for file: {count}')
-        return count > 0
+        sqlite_obj = SQLiteCRUD(self.db_path)
+        data = deepcopy(chunks)
+        for obj in data:
+            obj["file_hash"] = file_hash
+        sqlite_obj.insert_many(self.table_name, data)
+        sqlite_obj.close()
 
     def _load_embedding_text_from_db(self, file_hash):
         print('Loading embedding texts from DB')
-        conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT id, embedding_text FROM chunks WHERE file_hash=?", (file_hash,)).fetchall()
-        conn.close()
-        ids = [r[0] for r in rows]
-        embedding_texts = [r[1] for r in rows]
+
+        sqlite_obj = SQLiteCRUD(self.db_path)
+        rows = sqlite_obj.get_where(self.table_name, "file_hash", file_hash)
+        sqlite_obj.close()
+        print(rows)
+        ids = [r["id"] for r in rows]
+        embedding_texts = [r["text"] for r in rows]
         print(f'Loaded {len(embedding_texts)} embedding texts')
         return ids, embedding_texts
 
     def _fetch_chunks_by_ids(self, chunk_ids):
         """Fetch full chunk rows for a list of row ids."""
-        conn = sqlite3.connect(self.db_path)
-        placeholders = ','.join('?' * len(chunk_ids))
-        rows = conn.execute(
-            f"SELECT id, title, source, cleaned_text FROM chunks WHERE id IN ({placeholders})",
-            chunk_ids
-        ).fetchall()
-        conn.close()
-        # preserve caller-supplied order
-        id_to_row = {r[0]: r for r in rows}
-        return [
-            {'id': id_to_row[cid][0], 'heading': id_to_row[cid][1],
-             'page': id_to_row[cid][2], 'text': id_to_row[cid][3]}
-            for cid in chunk_ids if cid in id_to_row
-        ]
+        sqlite_obj = SQLiteCRUD(self.db_path)
+        rows = sqlite_obj.get_by_ids(self.table_name, chunk_ids)
+        sqlite_obj.close()
+        return rows
+
+    def _check_if_file_processed(self, file_hash):
+        sqlite_obj = SQLiteCRUD(self.db_path)
+        rows = sqlite_obj.get_where(self.table_name, "file_hash", file_hash)
+        sqlite_obj.close()
+        count = len(rows)
+        print(f'Existing records for file: {count}')
+        return count > 0
 
     def _append_chunks_to_index(self, ids, embedding_texts):
         index = self._load_faiss()
@@ -99,18 +93,21 @@ class VectorDB:
         index.add_with_ids(embeddings, np.array(ids, dtype=np.int32))
         self._save_faiss(index)
 
-    def append_chunks(self, file_hash, chunks):
+    def append_chunks(self, chunks, file_hash=None):
+        if file_hash is None:
+            file_hash = str(uuid.uuid4())
         if not self._check_if_file_processed(file_hash):
             self._append_chunks_to_db(file_hash, chunks)
             ids, embedding_texts = self._load_embedding_text_from_db(file_hash)
             self._append_chunks_to_index(ids, embedding_texts)
+            return ids
+        return []
 
     def _search_faiss(self, text, k=3):
         index = self._load_faiss()
-        search_k = min(k, index.ntotal)
-        text_embedding = self.model.encode([text])[0]
-        distances, indices = index.search(text_embedding, search_k)
-        return distances, indices
+        text_embedding = self.model.encode([text])
+        distances, indices = index.search(text_embedding, k)
+        return distances.tolist()[0], indices.tolist()[0]
 
     def retrieve_chunks(self, text, k=3):
         distances, indices = self._search_faiss(text, k)

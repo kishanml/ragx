@@ -8,14 +8,12 @@ from langchain_core.messages import SystemMessage
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling_core.types.doc.document import DoclingDocument
-from litellm import query
 
-from faiss_vec import FaissVectorDB
+from vector_framework import VectorFramework
 from schemas import Chunk, Document, Output
 from store import chunk_entities_extraction_prompt
 from tokenizer import Tokenizer
-from utils import Timer, generate_sha256_hash, preprocess_text, get_file_hash, create_summary_chunks, create_questions_chunks
-from vector_db import VectorDB
+from utils import Timer, generate_sha256_hash, preprocess_text, get_file_hash
 import json
 from dotenv import load_dotenv
 load_dotenv()
@@ -164,9 +162,9 @@ class DocSegmenter(Tokenizer):
             text_chunks, text_tokens, text_topics = self._title_based_chunking(document.source)
             assert len(text_chunks) == len(text_tokens) == len(text_topics)        
             chunk_list = self._adjust_token_size(text_chunks, text_tokens, text_topics)
-        
-        with Timer("Generating chunk's entities"):
-            document.chunks = list(map(self._update_chunk_entities, chunk_list))
+            document.chunks = chunk_list
+        # with Timer("Generating chunk's entities"):
+        #     document.chunks = list(map(self._update_chunk_entities, chunk_list))
         
         return document
     
@@ -179,28 +177,26 @@ class DocSegmenter(Tokenizer):
 
 if __name__ == "__main__":
     
-    document_fp = Path("/home/kishanm/Documents/ragx/document/CTMP Process Brightness Optimisation and Control_ Latency Tank to Bleach Tower.pdf")
+    document_fp = Path("/home/shubhamg/PycharmProjects/ragx/src/ragx/CTMP Process Brightness Optimisation and Control_ Latency Tank to Bleach Tower.pdf")
     fixed_keys = ["title", "source", "cleaned_text"]
     if not document_fp.exists():
         print('yes')
     doc_seg = DocSegmenter()
-
-    summary_vector_db = VectorDB("summary_index.faiss", "summary_db.sqlite")
-    questions_vector_db = VectorDB("questions_index.faiss", "questions_db.sqlite")
-
+    vec_framework = VectorFramework("doc_framework")
     data = doc_seg.generate_chunks(document_path=document_fp)
     chunks = [json.loads(chunk.model_dump_json(indent=2)) for chunk in data.chunks]
     file_hash = get_file_hash(document_fp)
-    summary_chunks = create_summary_chunks(chunks, fixed_keys)
-    questions_chunks = create_questions_chunks(chunks, fixed_keys)
 
-    summary_vector_db.append_chunks(file_hash, summary_chunks)
-    questions_vector_db.append_chunks(file_hash, questions_chunks)
+    modified_chunks = []
+    for chunk in chunks:
+        new_chunk = {}
+        for k, v in chunk.items():
+            if k == "source":
+                new_chunk["text"] = v
+        modified_chunks.append(new_chunk)
 
-    query = "what is ctmp?"
-    summary_db_similar_chunks, summary_db_distances = summary_vector_db.retrieve_chunks(query)
-    questions_db_similar_chunks, questions_db_distances = questions_vector_db.retrieve_chunks(query)
-
+    vec_framework.append_chunks(file_hash, modified_chunks)
+    print(vec_framework.retrieve_chunks("what is ctmp", use_reranker=True))
 
 
 

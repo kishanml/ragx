@@ -2,9 +2,10 @@
 Evaluation module for RAG pipeline
 """
 
-import json
 import numpy as np
 from collections import defaultdict
+from pydantic import BaseModel, Field
+from langchain_core.messages import SystemMessage
 from ranx import Qrels, Run, evaluate
 
 
@@ -114,25 +115,55 @@ def calculate_diversity_at_k(retrieved_chunks, k):
 
 # TIER 2: GENERATION QUALITY METRICS
 
-def parse_llm_json_response(response):
+
+class ContextRelevanceResult(BaseModel):
+    relevant: bool = Field(..., description="Whether the context is relevant to the query")
+    score: float = Field(..., description="Relevance score: 0.0, 0.5, or 1.0")
+    explanation: str = Field(default="", description="Brief explanation of the judgment")
+
+
+class FaithfulnessResult(BaseModel):
+    faithful: bool = Field(..., description="Whether the answer is faithful to the provided contexts")
+    score: float = Field(..., description="Faithfulness score: 0.0, 0.5, or 1.0")
+    explanation: str = Field(default="", description="Brief explanation of the judgment")
+    unsupported_claims: list[str] = Field(default_factory=list, description="Claims not supported by the contexts")
+
+
+class AnswerRelevanceResult(BaseModel):
+    relevant: bool = Field(..., description="Whether the answer addresses the query")
+    score: float = Field(..., description="Relevance score: 0.0, 0.5, or 1.0")
+    completeness_score: int = Field(..., description="Completeness score from 0 to 10")
+    explanation: str = Field(default="", description="Brief explanation of the judgment")
+
+
+class ContextSupportResult(BaseModel):
+    sufficient: bool = Field(..., description="Whether the contexts sufficiently support the answer")
+    score: float = Field(..., description="Sufficiency score: 0.0, 0.5, or 1.0")
+    sufficiency_score: int = Field(..., description="Sufficiency score from 0 to 10")
+    explanation: str = Field(default="", description="Brief explanation of the judgment")
+    missing_info: list[str] = Field(default_factory=list, description="Important missing information")
+
+
+class QuestionAnswerabilityResult(BaseModel):
+    answerable: bool = Field(..., description="Whether the question can be answered from the contexts")
+    score: float = Field(..., description="Answerability score: 0.0, 0.5, or 1.0")
+    confidence_score: int = Field(..., description="Confidence score from 0 to 10")
+    explanation: str = Field(default="", description="Brief explanation of the judgment")
+
+
+class SelfContainmentResult(BaseModel):
+    self_contained: bool = Field(..., description="Whether the answer is understandable without the question")
+    score: float = Field(..., description="Self-containment score: 0.0, 0.5, or 1.0")
+    clarity_score: int = Field(..., description="Clarity score from 0 to 10")
+    explanation: str = Field(default="", description="Brief explanation of the judgment")
+
+
+def _invoke_structured_judge(judge_llm, prompt: str, response_model: type[BaseModel]):
     """
-    parse JSON from LLM response, handling markdown code blocks
-    
-    args:
-        response: Raw LLM response string
-        
-    returns:
-        Parsed JSON dict
+    Invoke a chat model with a Pydantic response schema.
     """
-    response = response.strip()
-    
-    # removed markdown code blocks
-    if response.startswith('```json'):
-        response = response.split('```json')[1].split('```')[0].strip()
-    elif response.startswith('```'):
-        response = response.split('```')[1].split('```')[0].strip()
-    
-    return json.loads(response)
+    structured_llm = judge_llm.with_structured_output(response_model)
+    return structured_llm.invoke([SystemMessage(content=prompt)])
 
 
 def evaluate_context_relevance(query, contexts, judge_llm):
@@ -167,13 +198,11 @@ def evaluate_context_relevance(query, contexts, judge_llm):
             Context: {context}
 
             Evaluate the relevance of this context to the query.
-            Respond with ONLY a JSON object:
-            {{'relevant': true/false, 'score': 0.0/0.5/1.0, 'explanation': 'brief explanation'}}"""
+            Return a structured response that matches the schema."""
 
         try:
-            response = judge_llm.invoke(prompt).content
-            result = parse_llm_json_response(response)
-            score = result.get('score', 1.0 if result.get('relevant', False) else 0.0)
+            result = _invoke_structured_judge(judge_llm, prompt, ContextRelevanceResult)
+            score = result.score if result.score is not None else (1.0 if result.relevant else 0.0)
             relevance_scores.append(score)
         except Exception as e:
             print(f'Error evaluating context {i}: {e}')
@@ -219,18 +248,16 @@ def evaluate_faithfulness(answer, contexts, judge_llm):
         {answer}
 
         Evaluate the faithfulness of the answer to the contexts.
-        Respond with ONLY a JSON object:
-        {{'faithful': true/false, 'score': 0.0/0.5/1.0, 'explanation': 'brief explanation', 'unsupported_claims': ['list any unsupported claims']}}"""
+        Return a structured response that matches the schema."""
 
     try:
-        response = judge_llm.invoke(prompt).content
-        result = parse_llm_json_response(response)
-        score = result.get('score', 1.0 if result.get('faithful', False) else 0.0)
+        result = _invoke_structured_judge(judge_llm, prompt, FaithfulnessResult)
+        score = result.score if result.score is not None else (1.0 if result.faithful else 0.0)
         
         return {
             'faithfulness_score': score,
-            'explanation': result.get('explanation', ''),
-            'unsupported_claims': result.get('unsupported_claims', [])
+            'explanation': result.explanation,
+            'unsupported_claims': result.unsupported_claims
         }
     except Exception as e:
         print(f'Error evaluating faithfulness: {e}')
@@ -266,18 +293,16 @@ def evaluate_answer_relevance(query, answer, judge_llm):
         Answer: {answer}
 
         Evaluate the relevance of the answer to the query.
-        Respond with ONLY a JSON object:
-        {{'relevant': true/false, 'score': 0.0/0.5/1.0, 'completeness_score': 0-10, 'explanation': 'brief explanation'}}"""
+        Return a structured response that matches the schema."""
 
     try:
-        response = judge_llm.invoke(prompt).content
-        result = parse_llm_json_response(response)
-        score = result.get('score', 1.0 if result.get('relevant', False) else 0.0)
+        result = _invoke_structured_judge(judge_llm, prompt, AnswerRelevanceResult)
+        score = result.score if result.score is not None else (1.0 if result.relevant else 0.0)
         
         return {
             'answer_relevance_score': score,
-            'completeness_score': result.get('completeness_score', 0) / 10.0,
-            'explanation': result.get('explanation', '')
+            'completeness_score': result.completeness_score / 10.0,
+            'explanation': result.explanation
         }
     except Exception as e:
         print(f'Error evaluating answer relevance: {e}')
@@ -348,19 +373,17 @@ def evaluate_context_support(contexts, answer, judge_llm):
         {answer}
 
         Evaluate whether the contexts sufficiently support generating this answer.
-        Respond with ONLY a JSON object:
-        {{'sufficient': true/false, 'score': 0.0/0.5/1.0, 'sufficiency_score': 0-10, 'explanation': 'brief explanation', 'missing_info': ['list any missing information']}}"""
+        Return a structured response that matches the schema."""
 
     try:
-        response = judge_llm.invoke(prompt).content
-        result = parse_llm_json_response(response)
-        score = result.get('score', 1.0 if result.get('sufficient', False) else 0.0)
+        result = _invoke_structured_judge(judge_llm, prompt, ContextSupportResult)
+        score = result.score if result.score is not None else (1.0 if result.sufficient else 0.0)
         
         return {
             'context_support_score': score,
-            'sufficiency_score': result.get('sufficiency_score', 0) / 10.0,
-            'explanation': result.get('explanation', ''),
-            'missing_info': result.get('missing_info', [])
+            'sufficiency_score': result.sufficiency_score / 10.0,
+            'explanation': result.explanation,
+            'missing_info': result.missing_info
         }
     except Exception as e:
         print(f'Error evaluating context support: {e}')
@@ -399,18 +422,16 @@ def evaluate_question_answerability(query, contexts, judge_llm):
         {context_combined}
 
         Evaluate whether this question can be answered using these contexts.
-        Respond with ONLY a JSON object:
-        {{'answerable': true/false, 'score': 0.0/0.5/1.0, 'confidence_score': 0-10, 'explanation': 'brief explanation'}}"""
+        Return a structured response that matches the schema."""
 
     try:
-        response = judge_llm.invoke(prompt).content
-        result = parse_llm_json_response(response)
-        score = result.get('score', 1.0 if result.get('answerable', False) else 0.0)
+        result = _invoke_structured_judge(judge_llm, prompt, QuestionAnswerabilityResult)
+        score = result.score if result.score is not None else (1.0 if result.answerable else 0.0)
         
         return {
             'question_answerability_score': score,
-            'confidence_score': result.get('confidence_score', 0) / 10.0,
-            'explanation': result.get('explanation', '')
+            'confidence_score': result.confidence_score / 10.0,
+            'explanation': result.explanation
         }
     except Exception as e:
         print(f'Error evaluating question answerability: {e}')
@@ -445,18 +466,16 @@ def evaluate_self_containment(query, answer, judge_llm):
         Answer: {answer}
 
         Evaluate whether this answer is self-contained.
-        Respond with ONLY a JSON object:
-        {{'self_contained': true/false, 'score': 0.0/0.5/1.0, 'clarity_score': 0-10, 'explanation': 'brief explanation'}}"""
+        Return a structured response that matches the schema."""
 
     try:
-        response = judge_llm.invoke(prompt).content
-        result = parse_llm_json_response(response)
-        score = result.get('score', 1.0 if result.get('self_contained', False) else 0.0)
+        result = _invoke_structured_judge(judge_llm, prompt, SelfContainmentResult)
+        score = result.score if result.score is not None else (1.0 if result.self_contained else 0.0)
         
         return {
             'self_containment_score': score,
-            'clarity_score': result.get('clarity_score', 0) / 10.0,
-            'explanation': result.get('explanation', '')
+            'clarity_score': result.clarity_score / 10.0,
+            'explanation': result.explanation
         }
     except Exception as e:
         print(f'Error evaluating self-containment: {e}')
